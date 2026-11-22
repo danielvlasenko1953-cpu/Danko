@@ -371,7 +371,7 @@ function slugify(s) {
  */
 (function () {
   const LS = "abi24:data";
-  let data = {}, pending = 0, pollT = null;
+  let data = {}, pending = 0, pollT = null, stamps = {};
   let mode = "local"; // local | live | connecting | error
   let client = null;
   const subs = new Set();
@@ -383,6 +383,7 @@ function slugify(s) {
   const err = msg => window.dispatchEvent(new CustomEvent("abi:error", { detail: msg }));
 
   function persist() {
+    if (client) return; // mit Supabase ist die Datenbank die Quelle, kein Browser-Cache nötig
     try { localStorage.setItem(LS, JSON.stringify(data)); }
     catch (e) { if (mode !== "live") err("Browser-Speicher voll – bitte weniger/kleinere Fotos oder Supabase nutzen."); }
   }
@@ -407,17 +408,17 @@ function slugify(s) {
     try {
       await loadScript("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2");
       client = window.supabase.createClient(c.supabaseUrl, c.supabaseAnonKey);
-      const { data: rows, error } = await client.from("abi_docs").select("key,value");
+      const { data: rows, error } = await client.from("abi_docs").select("key,value,updated_at");
       if (error) throw error;
-      rows.forEach(r => { data[r.key] = r.value; });
+      rows.forEach(r => { data[r.key] = r.value; stamps[r.key] = r.updated_at; });
       persist(); emit();
       // Sicherheitsnetz: alle 5 s neu abfragen, falls Realtime in Supabase nicht eingeschaltet ist
       mode = "live"; emitStatus();
-      pollT = setInterval(poll, 5000);
+      pollT = setInterval(poll, 8000);
       client.channel("abi_docs_changes")
         .on("postgres_changes", { event: "*", schema: "public", table: "abi_docs" }, p => {
-          if (p.eventType === "DELETE") delete data[p.old.key];
-          else data[p.new.key] = p.new.value;
+          if (p.eventType === "DELETE") { delete data[p.old.key]; delete stamps[p.old.key]; }
+          else { data[p.new.key] = p.new.value; stamps[p.new.key] = p.new.updated_at; }
           persist(); emit();
         })
         .subscribe(st => { mode = st === "SUBSCRIBED" ? "live" : "connecting"; emitStatus(); });
@@ -427,14 +428,23 @@ function slugify(s) {
     }
   }
 
+  // Leichtes Nachladen: nur Schlüssel + Zeitstempel abfragen (wenige KB), Inhalte/Bilder nur für wirklich geänderte Einträge
   async function poll() {
     if (!client || pending > 0 || document.hidden) return;
     try {
-      const { data: rows, error } = await client.from("abi_docs").select("key,value");
+      const { data: list, error } = await client.from("abi_docs").select("key,updated_at");
       if (error || pending > 0) return;
-      const next = {}; rows.forEach(r => { next[r.key] = r.value; });
-      if (JSON.stringify(next) !== JSON.stringify(data)) { data = next; persist(); emit(); }
-    } catch (e) { /* nächster Versuch in 5 s */ }
+      const remote = {}; list.forEach(r => { remote[r.key] = r.updated_at; });
+      let changed = false;
+      for (const k of Object.keys(stamps)) if (!(k in remote)) { delete stamps[k]; delete data[k]; changed = true; }
+      const need = Object.keys(remote).filter(k => !(k in stamps) || Date.parse(stamps[k]) !== Date.parse(remote[k]));
+      for (let i = 0; i < need.length; i += 25) {
+        const { data: rows, error: e2 } = await client.from("abi_docs").select("key,value,updated_at").in("key", need.slice(i, i + 25));
+        if (e2 || pending > 0) return;
+        rows.forEach(r => { data[r.key] = r.value; stamps[r.key] = r.updated_at; changed = true; });
+      }
+      if (changed) emit();
+    } catch (e) { /* nächster Versuch in 8 s */ }
   }
   document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
 
@@ -449,8 +459,9 @@ function slugify(s) {
       if (client) {
         pending++;
         try {
-          const { error } = await client.from("abi_docs").upsert({ key: k, value: v, updated_at: new Date().toISOString() });
-          if (error) err("Speichern fehlgeschlagen: " + error.message);
+          const ts = new Date().toISOString();
+          const { error } = await client.from("abi_docs").upsert({ key: k, value: v, updated_at: ts });
+          if (error) err("Speichern fehlgeschlagen: " + error.message); else stamps[k] = ts;
         } finally { pending--; }
       }
     },
@@ -460,7 +471,7 @@ function slugify(s) {
         pending++;
         try {
           const { error } = await client.from("abi_docs").delete().eq("key", k);
-          if (error) err("Löschen fehlgeschlagen: " + error.message);
+          if (error) err("Löschen fehlgeschlagen: " + error.message); else delete stamps[k];
         } finally { pending--; }
       }
     },
@@ -1019,4 +1030,3 @@ function slugify(s) {
 </script>
 </body>
 </html>
-
